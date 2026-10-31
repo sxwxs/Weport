@@ -84,6 +84,11 @@ type CachedImagePayload = {
    * 退回 `_t`，不会因此丢图。
    */
   excludeThumbnail?: boolean
+  /**
+   * 只接受缩略图档（`_t.dat`）。原图解不动、或原图是浏览器不可预览的格式（heic）时，
+   * 导出侧用它拿到能显示的 JPEG 兜底 —— 与 `excludeThumbnail` 恰好相反。
+   */
+  thumbVariantOnly?: boolean
 }
 
 type DecryptImagePayload = CachedImagePayload & {
@@ -93,6 +98,21 @@ type DecryptImagePayload = CachedImagePayload & {
 type PendingImageTask<T extends DecryptResult> = {
   promise: Promise<T>
   emitsEvents: boolean
+}
+
+/** ISO-BMFF 图片：主品牌决定扩展名（iPhone 原图是 heic 家族，Android/网页常见 avif）。 */
+const HEIC_IMAGE_BRANDS = new Set([
+  'heic', 'heix', 'hevc', 'hevx', 'heim', 'heis', 'hevm', 'hevs', 'mif1', 'msf1'
+])
+const AVIF_IMAGE_BRANDS = new Set(['avif', 'avis', 'avio'])
+
+function detectIsoBmffImageExtension(buffer: Buffer): string | null {
+  if (buffer.length < 12) return null
+  const isFtyp = buffer[4] === 0x66 && buffer[5] === 0x74 && buffer[6] === 0x79 && buffer[7] === 0x70
+  if (!isFtyp) return null
+  const brand = buffer.subarray(8, 12).toString('latin1').toLowerCase()
+  if (AVIF_IMAGE_BRANDS.has(brand)) return '.avif'
+  return HEIC_IMAGE_BRANDS.has(brand) ? '.heic' : null
 }
 
 export class ImageDecryptService {
@@ -245,6 +265,7 @@ export class ImageDecryptService {
   ): Promise<DecryptResult & { hasUpdate?: boolean }> {
     for (const key of cacheKeys) {
       const cached = this.getResolvedMediaCache(payload, key)
+      if (payload.thumbVariantOnly === true && cached && !this.isThumbTierPath(cached)) continue
       if (cached && existsSync(cached) && this.isUsableImageCacheFile(cached)) {
         let skipPromotion = false
         if (payload.excludeThumbnail === true) {
@@ -295,6 +316,7 @@ export class ImageDecryptService {
         {
           allowThumbnail: true,
           excludeThumbnail: payload.excludeThumbnail === true,
+          thumbVariantOnly: payload.thumbVariantOnly === true,
           skipResolvedCache: false,
           hardlinkOnly: true,
           allowDatNameScanFallback: payload.allowCacheIndex !== false,
@@ -303,7 +325,9 @@ export class ImageDecryptService {
       )
       if (datPath) {
         const existingRaw = this.findCachedOutputByDatPath(datPath, payload.sessionId, false)
-        const existing = this.shouldRejectThumbnailOutput(payload, datPath, existingRaw) ? null : existingRaw
+        const existing = this.shouldRejectThumbnailOutput(payload, datPath, existingRaw)
+          || (payload.thumbVariantOnly === true && Boolean(existingRaw) && !this.isThumbTierPath(existingRaw))
+          ? null : existingRaw
         if (existing) {
           const upgraded = !this.isHdPath(existing) && payload.allowCachePromotion !== false
             ? await this.tryPromoteThumbnailCache(payload, cacheKey, existing)
@@ -357,7 +381,9 @@ export class ImageDecryptService {
 
     if (!payload.force) {
       const cached = this.getResolvedMediaCache(payload, cacheKey)
-      if (cached && existsSync(cached) && this.isUsableImageCacheFile(cached)) {
+      // thumbVariantOnly 时缓存映射里的高档产物要跳过，落下去解密 `_t.dat`
+      if (cached && existsSync(cached) && this.isUsableImageCacheFile(cached)
+        && !(payload.thumbVariantOnly === true && !this.isThumbTierPath(cached))) {
         let useCached = true
         let skipPromotion = false
         if (payload.excludeThumbnail === true) {
@@ -572,6 +598,7 @@ export class ImageDecryptService {
             allowThumbnail: true,
             // 导出这类"要画质"的调用：缩略图只当最后的兜底，显示版 / 原图优先
             excludeThumbnail: payload.excludeThumbnail === true,
+            thumbVariantOnly: payload.thumbVariantOnly === true,
             skipResolvedCache: false,
             hardlinkOnly: payload.hardlinkOnly === true,
             allowDatNameScanFallback: payload.allowCacheIndex !== false,
@@ -706,13 +733,16 @@ export class ImageDecryptService {
         // issue #20：两个账号同机时最常见的原因不是"文件坏了"，而是**用错了账号
         // 的密钥**（加密能跑完，但解出来是噪声）。旧文案只回"解密后不是有效图片"，
         // 用户既不知道是密钥问题，也不知道要回到连接页重取 —— 必须带上下一步。
+        // 但"解不出图片"也可能是尚不支持的封装格式，文案不能把密钥说成唯一原因，
+        // 否则同账号少数几张异常图会被一路误导到重取密钥上去。
         this.logError('解密后不是有效图片', undefined, {
           datPath,
           wxid,
           xorKey,
           hasAesKey: Boolean(aesKeyForNative)
         })
-        const hint = `密钥可能属于另一个微信账号（同一台电脑登录过多个账号时最常见）：`
+        const hint = `解密结果不是可识别的图片（支持 jpg/png/gif/webp/heic/avif）。`
+          + `若整批图片都这样，多半是密钥属于另一个微信账号（同一台电脑登录过多个账号时最常见）：`
           + `请回到「连接」页选中当前账号后重新点「获取图片密钥」，再用该账号在微信里打开几张图片`
         this.emitDecryptProgress(payload, cacheKey, 'failed', 100, 'error', '解密后不是有效图片')
         return {
@@ -844,11 +874,13 @@ export class ImageDecryptService {
     imageDatName?: string,
     sessionId?: string,
     createTime?: number,
-    options?: { allowThumbnail?: boolean; excludeThumbnail?: boolean; skipResolvedCache?: boolean; hardlinkOnly?: boolean; allowDatNameScanFallback?: boolean; allowFilesystemScan?: boolean }
+    options?: { allowThumbnail?: boolean; excludeThumbnail?: boolean; thumbVariantOnly?: boolean; skipResolvedCache?: boolean; hardlinkOnly?: boolean; allowDatNameScanFallback?: boolean; allowFilesystemScan?: boolean }
   ): Promise<string | null> {
     const allowThumbnail = options?.allowThumbnail ?? true
     // 注意与 allowThumbnail=false（只要原图）区分：本档仍接受显示版 `<md5>.dat`
     const excludeThumbnail = options?.excludeThumbnail === true
+    // 反向档：只要 `_t`，用于原图不可用/不可预览时的显示兜底
+    const thumbVariantOnly = options?.thumbVariantOnly === true
     const skipResolvedCache = options?.skipResolvedCache ?? false
     const hardlinkOnly = options?.hardlinkOnly ?? false
     const allowDatNameScanFallback = options?.allowDatNameScanFallback ?? true
@@ -880,6 +912,7 @@ export class ImageDecryptService {
       createTime,
       allowThumbnail,
       excludeThumbnail,
+      thumbVariantOnly,
       allowDatNameScanFallback,
       skipResolvedCache,
       allowFilesystemScan
@@ -903,6 +936,7 @@ export class ImageDecryptService {
         const cached = this.getResolvedCache(scopedKey)
         if (!cached || !existsSync(cached)) continue
         if (!allowThumbnail && !this.isHdDatPath(cached)) continue
+        if (thumbVariantOnly && !this.isTVariantDat(cached)) continue
         if (excludeThumbnail && this.isTVariantDat(cached)) {
           if (!thumbnailFallbackPath) thumbnailFallbackPath = cached
           continue
@@ -917,6 +951,7 @@ export class ImageDecryptService {
         const hardlinkPath = await this.resolveHardlinkPath(accountDir, baseMd5, sessionId)
         if (!hardlinkPath) continue
         if (!allowThumbnail && !this.isHdDatPath(hardlinkPath)) continue
+        if (thumbVariantOnly && !this.isTVariantDat(hardlinkPath)) continue
         // hardlink 索引只认 md5、不认档位：命中缩略图不能就此收工，
         // 用户点开过图片的话显示版就在同一目录里
         if (excludeThumbnail && this.isTVariantDat(hardlinkPath)) {
@@ -940,7 +975,7 @@ export class ImageDecryptService {
     }
 
     for (const baseMd5 of lookupBases) {
-      const selectedPath = this.selectBestDatPathByBase(accountDir, baseMd5, sessionId, createTime, allowThumbnail)
+      const selectedPath = this.selectBestDatPathByBase(accountDir, baseMd5, sessionId, createTime, allowThumbnail, thumbVariantOnly)
       if (!selectedPath) continue
 
       this.cacheDatPath(accountDir, baseMd5, selectedPath)
@@ -1312,12 +1347,20 @@ export class ImageDecryptService {
     baseMd5: string,
     sessionId?: string,
     createTime?: number,
-    allowThumbnail = true
+    allowThumbnail = true,
+    thumbVariantOnly = false
   ): string | null {
     const candidates = this.collectAllDatCandidatesForBase(accountDir, baseMd5, sessionId, createTime)
     if (candidates.length === 0) return null
 
     const imgCandidates = candidates.filter((item) => this.isImgScopedDatPath(item))
+
+    if (thumbVariantOnly) {
+      return this.pickLargestDatPath(imgCandidates.filter((item) => this.isTVariantDat(item)))
+        || this.pickLargestDatPath(candidates.filter((item) => this.isTVariantDat(item)))
+        || null
+    }
+
     const imgHdCandidates = imgCandidates.filter((item) => this.isHdDatPath(item))
     const hdInImg = this.pickLargestDatPath(imgHdCandidates)
     if (hdInImg) return hdInImg
@@ -1426,6 +1469,7 @@ export class ImageDecryptService {
     createTime?: number,
     allowThumbnail = true,
     excludeThumbnail = false,
+    thumbVariantOnly = false,
     allowDatNameScanFallback = true,
     skipResolvedCache = false,
     allowFilesystemScan = true
@@ -1445,6 +1489,7 @@ export class ImageDecryptService {
       allowThumbnail ? 'all' : 'hd',
       // 进 key 隔离：否则"跳过缩略图"那次记下的 miss 会挡住随后允许缩略图的查询
       excludeThumbnail ? 'nothumb1' : 'nothumb0',
+      thumbVariantOnly ? 'thumbonly1' : 'thumbonly0',
       allowDatNameScanFallback ? 'fallback1' : 'fallback0',
       skipResolvedCache ? 'skip-cache1' : 'skip-cache0',
       allowFilesystemScan ? 'fs-scan1' : 'fs-scan0',
@@ -1798,7 +1843,7 @@ export class ImageDecryptService {
     const normalizedBase = this.normalizeDatBase(base)
     const primarySuffix = this.getCacheVariantSuffixFromDat(datPath)
     const suffixes = this.buildCacheSuffixSearchOrder(primarySuffix, preferHd)
-    const extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp']
+    const extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.avif']
 
     const root = this.getCacheRoot()
     const contactDir = this.sanitizeDirName(sessionId || 'unknown')
@@ -1980,6 +2025,7 @@ export class ImageDecryptService {
       sessionId,
       String(createTime),
       payload.force === true ? 'f1' : 'f0',
+      payload.thumbVariantOnly === true ? 't1' : 't0',
       payload.hardlinkOnly === true ? 'hl1' : 'hl0',
       payload.disableUpdateCheck === true ? 'du1' : 'du0',
       payload.allowCacheIndex === false ? 'ci0' : 'ci1',
@@ -2318,7 +2364,7 @@ export class ImageDecryptService {
       buffer[8] === 0x57 && buffer[9] === 0x45 && buffer[10] === 0x42 && buffer[11] === 0x50) {
       return '.webp'
     }
-    return null
+    return detectIsoBmffImageExtension(buffer)
   }
 
   private bufferToDataUrl(buffer: Buffer, ext: string): string | null {
@@ -2360,6 +2406,11 @@ export class ImageDecryptService {
         return 'image/jpeg'
       case '.webp':
         return 'image/webp'
+      case '.heic':
+      case '.heif':
+        return 'image/heic'
+      case '.avif':
+        return 'image/avif'
       default:
         return null
     }
@@ -2378,6 +2429,7 @@ export class ImageDecryptService {
   private isImageFile(filePath: string): boolean {
     const ext = extname(filePath).toLowerCase()
     return ext === '.gif' || ext === '.png' || ext === '.jpg' || ext === '.jpeg' || ext === '.webp'
+      || ext === '.heic' || ext === '.heif' || ext === '.avif'
   }
 
   private isUsableImageCacheFile(filePath: string): boolean {
@@ -2799,6 +2851,16 @@ export class ImageDecryptService {
   private isThumbnailDat(name: string): boolean {
     const lower = name.toLowerCase()
     return lower.includes('_t.dat') || lower.includes('.t.dat') || lower.includes('_thumb.dat')
+  }
+
+  /** 缩略图档判定，DAT 与解密产物都认（thumbVariantOnly 用它筛掉更高档的缓存映射）。 */
+  private isThumbTierPath(p?: string | null): boolean {
+    const raw = String(p || '').split('?')[0]
+    if (!raw) return false
+    const name = basename(raw).toLowerCase()
+    if (name.endsWith('.dat')) return this.isThumbnailDat(name)
+    const suffix = this.getCacheVariantSuffixFromCachedPath(raw)
+    return suffix === '_t' || suffix === '.t' || suffix === '_thumb' || suffix === '.thumb'
   }
 
   private isHdDatPath(datPath: string): boolean {

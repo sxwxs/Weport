@@ -3463,15 +3463,46 @@ export class ExportContext {
           // issue #15/#5b：记录本条消息是否因缺图片解密密钥而失败。
           // 在最终占位分支统一计数一次，避免回填重试把同一条消息算两次。
           let sawMissingImageKey = false
+          // 兜底必须真的能兜住，不能只查缓存：缓存里没有缩略图产物时，
+          // 磁盘上的 `_t.dat` 才是唯一还能显示的东西。
+          const pickResolvedImagePath = (result: any): string | null => {
+            if (!result?.success) return null
+            const resolved = String(result.localPath || '').trim()
+            return resolved || null
+          }
+
+          /**
+           * 只接受缩略图档（`_t.dat`）。原图解不动、或原图是浏览器不可预览的格式（heic）时，
+           * 导出侧用它拿到能显示的图兜底 —— 与 `excludeThumbnail` 恰好相反。
+           */
+          const tryResolveThumbnailPath = async (imageMd5?: string, imageDatName?: string): Promise<string | null> => {
+            const shared = {
+              sessionId,
+              imageMd5,
+              imageDatName,
+              createTime: msg.createTime,
+              preferFilePath: true,
+              hardlinkOnly: true,
+              allowCacheIndex: true,
+              suppressEvents: true,
+              thumbVariantOnly: true
+            }
+            const cachedThumb = await imageDecryptService.resolveCachedImage({
+              ...shared,
+              disableUpdateCheck: true
+            })
+            const cachedPath = pickResolvedImagePath(cachedThumb)
+            if (cachedPath) return cachedPath
+            const decryptedThumb = await imageDecryptService.decryptImage({
+              ...shared,
+              force: false
+            })
+            return pickResolvedImagePath(decryptedThumb)
+          }
+
           const tryResolveImagePath = async (imageMd5?: string, imageDatName?: string): Promise<string | null> => {
             if (!imageMd5 && !imageDatName) return null
             return this.runWithChatImagePipelineLimit(async () => {
-              const pickResolvedImagePath = (result: any): string | null => {
-                if (!result?.success) return null
-                const resolved = String(result.localPath || '').trim()
-                return resolved || null
-              }
-
               const resolveCachedPath = async (candidateMd5?: string, candidateDatName?: string): Promise<string | null> => {
                 const cachedResult = await imageDecryptService.resolveCachedImage({
                   sessionId,
@@ -3526,20 +3557,10 @@ export class ExportContext {
                 console.log(`[Export] 图片本地无数据 (localId=${msg.localId}): imageMd5=${imageMd5 || ''}, imageDatName=${imageDatName || ''}, error=${decryptResult.error || '未知'}`)
               }
 
-              const thumbResult = await imageDecryptService.resolveCachedImage({
-                sessionId,
-                imageMd5,
-                imageDatName,
-                createTime: msg.createTime,
-                preferFilePath: true,
-                hardlinkOnly: true,
-                disableUpdateCheck: true,
-                allowCacheIndex: true,
-                suppressEvents: true
-              })
-              if (thumbResult.success && thumbResult.localPath) {
-                console.log(`[Export] 使用缩略图替代 (localId=${msg.localId}): ${thumbResult.localPath}`)
-                return thumbResult.localPath
+              const thumbPath = await tryResolveThumbnailPath(imageMd5, imageDatName)
+              if (thumbPath) {
+                console.log(`[Export] 使用缩略图替代 (localId=${msg.localId}): ${thumbPath}`)
+                return thumbPath
               }
               return null
             })
